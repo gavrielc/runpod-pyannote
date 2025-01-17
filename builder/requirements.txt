@@ -1,11 +1,9 @@
 # Required Python packages get listed here, one per line.
-# Reccomended to lock the version number to avoid unexpected changes.
+# Versions are locked to ensure consistency
 
-# You can also install packages from a git repository, e.g.:
-# git+https://github.com/runpod/runpod-python.git
-# To learn more, see https://pip.pypa.io/en/stable/reference/requirements-file-format/
-
-runpod~=1.7.0
-pyannote.audio
-torch>=2.0.0
-torchaudio>=2.0.0 
+numpy==1.24.3
+runpod==1.7.0
+ffmpeg-python==0.2.0
+pyannote.audio==3.3.2
+torch==2.2.0
+torchaudio==2.2.0 

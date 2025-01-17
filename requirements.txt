@@ -1,4 +1,5 @@
+numpy==1.24.3
 runpod==1.7.0
-pyannote.audio
-torch>=2.0.0
-torchaudio>=2.0.0 
+pyannote.audio==3.3.2
+torch==2.2.0
+torchaudio==2.2.0 
