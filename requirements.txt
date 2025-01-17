@@ -1,4 +1,4 @@
-runpod==1.5.0
+runpod==1.7.0
 pyannote.audio
 torch>=2.0.0
 torchaudio>=2.0.0 

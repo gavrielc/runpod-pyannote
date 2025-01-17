@@ -6,3 +6,6 @@
 # To learn more, see https://pip.pypa.io/en/stable/reference/requirements-file-format/
 
 runpod~=1.7.0
+pyannote.audio
+torch>=2.0.0
+torchaudio>=2.0.0 
