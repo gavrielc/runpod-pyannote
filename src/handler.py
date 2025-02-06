@@ -11,6 +11,13 @@ from pyannote.audio import Pipeline
 import requests
 from urllib.parse import urlparse, unquote
 import uuid
+from threading import Lock
+import functools
+import contextlib
+import tempfile
+from pathlib import Path
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 def get_memory_usage():
     """Get current memory usage."""
@@ -46,8 +53,54 @@ print(f"Container memory limit: {'unlimited' if memory_limit is None else f'{mem
 print("Environment variables:", {k: v for k, v in os.environ.items() if not k.startswith('AWS_')})
 print("=== Initialization logs end ===")
 
-# Load the pipeline globally for reuse across requests
-PIPELINE = None
+class PipelineSingleton:
+    _instance = None
+    _lock = Lock()
+    
+    @classmethod
+    def get_pipeline(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:  # Double-check pattern
+                    try:
+                        print("Loading pyannote.audio pipeline...")
+                        start_time = time.time()
+                        
+                        auth_token = os.environ.get('HUGGINGFACE_TOKEN')
+                        if not auth_token:
+                            raise ValueError("HUGGINGFACE_TOKEN environment variable is required")
+                        
+                        print("Environment check:")
+                        print(f"CUDA available: {torch.cuda.is_available()}")
+                        print(f"Python version: {os.sys.version}")
+                        print(f"Torch version: {torch.__version__}")
+                        print(f"Number of CPU cores: {os.cpu_count()}")
+                        
+                        # Load pipeline with default settings
+                        pipeline = Pipeline.from_pretrained(
+                            "pyannote/speaker-diarization-3.1",
+                            use_auth_token=auth_token
+                        )
+                        
+                        # Configure based on available hardware
+                        if torch.cuda.is_available():
+                            print("CUDA is available, optimizing for GPU")
+                            pipeline.to(torch.device("cuda"))
+                            torch.backends.cudnn.benchmark = True
+                            print(f"Using GPU: {torch.cuda.get_device_name()}")
+                            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+                        else:
+                            print("CUDA is not available, running on CPU")
+                            
+                        duration = time.time() - start_time
+                        print(f"Pipeline loaded in {duration:.2f} seconds")
+                        cls._instance = pipeline
+                        
+                    except Exception as e:
+                        print(f"Error in pipeline initialization: {str(e)}")
+                        print(traceback.format_exc())
+                        raise
+        return cls._instance
 
 def get_file_extension_from_url(url):
     """Extract file extension from URL, defaulting to .wav if none found."""
@@ -73,139 +126,171 @@ def generate_unique_filename(prefix, extension):
     unique_id = str(uuid.uuid4())[:8]
     return os.path.join('/tmp', f"{prefix}_{timestamp}_{unique_id}{extension}")
 
+@contextlib.contextmanager
+def temporary_audio_file(prefix, suffix):
+    """Context manager for temporary audio files without auto deletion.
+    Caller is responsible for cleanup using cleanup_temp_file()."""
+    temp_file = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False)
+    try:
+        yield Path(temp_file.name)
+    finally:
+        temp_file.close()
+
+def cleanup_temp_file(file_path):
+    """Safely clean up a temporary file.
+    
+    Args:
+        file_path: String or Path object pointing to the file to remove
+    """
+    if file_path:
+        try:
+            Path(file_path).unlink(missing_ok=True)
+        except Exception as e:
+            print(f"Warning: Failed to clean up temporary file {file_path}: {e}")
+
+def create_robust_session():
+    """Create a requests session with retry logic and timeouts."""
+    session = requests.Session()
+    
+    # Configure retry strategy
+    retries = Retry(
+        total=3,  # number of retries
+        backoff_factor=1,  # wait 1, 2, 4 seconds between retries
+        status_forcelist=[500, 502, 503, 504],  # HTTP status codes to retry on
+        allowed_methods=["GET"]  # only retry on GET requests
+    )
+    
+    # Add retry adapter to session
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    
+    return session
+
 def download_audio(url):
     """Download audio from pre-signed URL with proper format handling."""
-    try:
-        # Get extension from URL
-        extension = get_file_extension_from_url(url)
-        temp_path = generate_unique_filename('input', extension)
-        print(f"Downloading audio from URL (detected format: {extension})")
-        
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        # Get file size if available
-        file_size = int(response.headers.get('content-length', 0))
-        
-        if file_size == 0:
-            print("Warning: Content-Length header not available, cannot track progress")
-        else:
-            print(f"File size: {file_size / 1024 / 1024:.1f}MB")
-        
-        start_time = time.time()
-        bytes_downloaded = 0
-        last_log_time = start_time
-        
-        with open(temp_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    bytes_downloaded += len(chunk)
-                    f.write(chunk)
-                    
-                    # Log progress every second
-                    current_time = time.time()
-                    if current_time - last_log_time >= 1.0:
-                        if file_size:
-                            progress = (bytes_downloaded / file_size) * 100
-                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
-                            print(f"Download progress: {progress:.1f}% ({speed:.1f}MB/s)")
-                        else:
-                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
-                            print(f"Downloaded {bytes_downloaded / 1024 / 1024:.1f}MB ({speed:.1f}MB/s)")
-                        last_log_time = current_time
-        
-        total_time = time.time() - start_time
-        average_speed = bytes_downloaded / total_time / 1024 / 1024  # MB/s
-        print(f"Download completed: {bytes_downloaded / 1024 / 1024:.1f}MB in {total_time:.1f}s ({average_speed:.1f}MB/s)")
-        
-        # Detect actual format
-        detected_format = detect_audio_format(temp_path)
-        print(f"Detected audio format: {detected_format}")
-        
-        # Convert to WAV if needed
-        if detected_format and detected_format != 'pcm_s16le':
-            print(f"Converting from {detected_format} to WAV format...")
-            wav_path = convert_to_wav(temp_path)
-            try:
-                os.remove(temp_path)  # Clean up original file
-            except Exception as e:
-                print(f"Warning: Failed to clean up temporary file: {e}")
-            return wav_path
-        elif detected_format == 'pcm_s16le':
-            print("File is already in WAV format, no conversion needed")
-            return temp_path
-        else:
-            print("Could not detect format, attempting conversion anyway...")
-            wav_path = convert_to_wav(temp_path)
-            try:
-                os.remove(temp_path)  # Clean up original file
-            except Exception as e:
-                print(f"Warning: Failed to clean up temporary file: {e}")
-            return wav_path
+    extension = get_file_extension_from_url(url)
+    
+    with temporary_audio_file(prefix='input_', suffix=extension) as temp_path:
+        try:
+            print(f"Downloading audio from URL (detected format: {extension})")
             
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to download audio: {str(e)}")
-    except Exception as e:
-        raise RuntimeError(f"Unexpected error during download: {str(e)}")
+            session = create_robust_session()
+            # Add timeouts: (connect timeout, read timeout)
+            with session.get(url, stream=True, timeout=(10, 300)) as response:
+                response.raise_for_status()
+                
+                file_size = int(response.headers.get('content-length', 0))
+                
+                if file_size == 0:
+                    print("Warning: Content-Length header not available")
+                else:
+                    print(f"File size: {file_size / 1024 / 1024:.1f}MB")
+                
+                start_time = time.time()
+                bytes_downloaded = 0
+                last_log_time = start_time
+                
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            bytes_downloaded += len(chunk)
+                            f.write(chunk)
+                            
+                            current_time = time.time()
+                            if current_time - last_log_time >= 1.0:
+                                if file_size:
+                                    progress = (bytes_downloaded / file_size) * 100
+                                    speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024
+                                    print(f"Download progress: {progress:.1f}% ({speed:.1f}MB/s)")
+                                else:
+                                    speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024
+                                    print(f"Downloaded {bytes_downloaded / 1024 / 1024:.1f}MB ({speed:.1f}MB/s)")
+                                last_log_time = current_time
+                
+                total_time = time.time() - start_time
+                average_speed = bytes_downloaded / total_time / 1024 / 1024
+                print(f"Download completed: {bytes_downloaded / 1024 / 1024:.1f}MB in {total_time:.1f}s ({average_speed:.1f}MB/s)")
+            
+            detected_format = detect_audio_format(str(temp_path))
+            print(f"Detected audio format: {detected_format}")
+            
+            if detected_format and detected_format != 'pcm_s16le':
+                print(f"Converting from {detected_format} to WAV format...")
+                return convert_to_wav(str(temp_path))
+            elif detected_format == 'pcm_s16le':
+                print("File is already in WAV format, no conversion needed")
+                return str(temp_path)
+            else:
+                print("Could not detect format, attempting conversion anyway...")
+                return convert_to_wav(str(temp_path))
+                
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to download audio: {str(e)}")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error during download: {str(e)}")
 
 def convert_to_wav(input_path):
     """Convert audio file to WAV format."""
-    output_path = generate_unique_filename('converted', '.wav')
-    try:
-        print(f"Starting audio conversion of {input_path}")
-        start_time = time.time()
-        
-        # Get input file information
-        probe = ffmpeg.probe(input_path)
-        input_sample_rate = next(
-            (stream['sample_rate'] for stream in probe['streams'] 
-             if stream['codec_type'] == 'audio'),
-            '16000'  # default to 16kHz if not found
-        )
-        
-        print(f"Input sample rate: {input_sample_rate}Hz")
-        
-        # Convert to WAV with specific parameters
-        stream = ffmpeg.input(input_path)
-        stream = ffmpeg.output(
-            stream, 
-            output_path,
-            acodec='pcm_s16le',  # 16-bit PCM
-            ac=1,                # mono
-            ar='16000',          # 16kHz
-            loglevel='warning'   # Show warnings and errors
-        )
-        
-        # Run the conversion
-        out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)
-        
-        # Verify the output file exists and is not empty
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError("Conversion failed: output file is missing or empty")
+    with temporary_audio_file(prefix='converted_', suffix='.wav') as output_path:
+        try:
+            print(f"Starting audio conversion of {input_path}")
+            start_time = time.time()
             
-        duration = time.time() - start_time
-        print(f"Audio conversion completed in {duration:.2f} seconds")
-        
-        # Verify the converted file
-        output_probe = ffmpeg.probe(output_path)
-        output_stream = next((stream for stream in output_probe['streams'] 
-                            if stream['codec_type'] == 'audio'), None)
-        
-        if output_stream:
-            print(f"Converted audio: {output_stream['codec_name']}, "
-                  f"{output_stream['sample_rate']}Hz, "
-                  f"{output_stream['channels']} channel(s)")
-        
-        return output_path
-        
-    except ffmpeg.Error as e:
-        error_message = e.stderr.decode() if e.stderr else str(e)
-        print(f"FFmpeg error: {error_message}")
-        raise RuntimeError(f"Failed to convert audio: {error_message}")
-    except Exception as e:
-        print(f"Unexpected error in convert_to_wav: {str(e)}")
-        print(traceback.format_exc())
-        raise
+            # Get input file information
+            probe = ffmpeg.probe(input_path)
+            input_sample_rate = next(
+                (stream['sample_rate'] for stream in probe['streams'] 
+                 if stream['codec_type'] == 'audio'),
+                '16000'  # default to 16kHz if not found
+            )
+            
+            print(f"Input sample rate: {input_sample_rate}Hz")
+            
+            # Convert to WAV with specific parameters
+            stream = ffmpeg.input(input_path)
+            stream = ffmpeg.output(
+                stream, 
+                str(output_path),
+                acodec='pcm_s16le',  # 16-bit PCM
+                ac=1,                # mono
+                ar='16000',          # 16kHz
+                loglevel='warning'   # Show warnings and errors
+            )
+            
+            # Run the conversion
+            out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)
+            
+            # Verify the output file exists and is not empty
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise RuntimeError("Conversion failed: output file is missing or empty")
+                
+            duration = time.time() - start_time
+            print(f"Audio conversion completed in {duration:.2f} seconds")
+            
+            # Verify the converted file
+            output_probe = ffmpeg.probe(str(output_path))
+            output_stream = next((stream for stream in output_probe['streams'] 
+                                if stream['codec_type'] == 'audio'), None)
+            
+            if output_stream:
+                print(f"Converted audio: {output_stream['codec_name']}, "
+                      f"{output_stream['sample_rate']}Hz, "
+                      f"{output_stream['channels']} channel(s)")
+            
+            # Clean up the input file since we're done with it
+            cleanup_temp_file(input_path)
+            
+            return str(output_path)
+            
+        except ffmpeg.Error as e:
+            error_message = e.stderr.decode() if e.stderr else str(e)
+            print(f"FFmpeg error: {error_message}")
+            raise RuntimeError(f"Failed to convert audio: {error_message}")
+        except Exception as e:
+            print(f"Unexpected error in convert_to_wav: {str(e)}")
+            print(traceback.format_exc())
+            raise
 
 def get_optimal_batch_size():
     """Determine optimal batch size based on available hardware."""
@@ -246,45 +331,13 @@ def validate_input(job_input):
     return True
 
 def load_model():
-    global PIPELINE
-    if PIPELINE is None:
-        try:
-            print("Loading pyannote.audio pipeline...")
-            start_time = time.time()
-            
-            auth_token = os.environ.get('HUGGINGFACE_TOKEN')
-            if not auth_token:
-                raise ValueError("HUGGINGFACE_TOKEN environment variable is required")
-            
-            print("Environment check:")
-            print(f"CUDA available: {torch.cuda.is_available()}")
-            print(f"Python version: {os.sys.version}")
-            print(f"Torch version: {torch.__version__}")
-            print(f"Number of CPU cores: {os.cpu_count()}")
-            
-            # Load pipeline with default settings
-            PIPELINE = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=auth_token
-            )
-            
-            # Configure based on available hardware
-            if torch.cuda.is_available():
-                print("CUDA is available, optimizing for GPU")
-                PIPELINE.to(torch.device("cuda"))
-                # Enable cudnn benchmarking for better performance
-                torch.backends.cudnn.benchmark = True
-                print(f"Using GPU: {torch.cuda.get_device_name()}")
-                print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-            else:
-                print("CUDA is not available, running on CPU")
-                
-            duration = time.time() - start_time
-            print(f"Pipeline loaded in {duration:.2f} seconds")
-        except Exception as e:
-            print(f"Error in load_model: {str(e)}")
-            print(traceback.format_exc())
-            raise
+    """Load the pyannote.audio pipeline."""
+    try:
+        return PipelineSingleton.get_pipeline()
+    except Exception as e:
+        print(f"Failed to initialize model: {str(e)}")
+        print(traceback.format_exc())
+        raise
 
 def debug_hook(step_name, step_artifact, file=None, **kwargs):
     """Debug hook for pyannote pipeline progress."""
@@ -333,6 +386,7 @@ def handler(job):
         }
     }
     """
+    audio_path = None
     try:
         print(f"\nReceived job input: {job}")
         job_input = job['input']
@@ -353,18 +407,15 @@ def handler(job):
         audio_path = download_audio(job_input['audio_url'])
         print(f"Final audio path: {audio_path}")
         
-        # Ensure model is loaded
-        if PIPELINE is None:
-            print("Loading model...")
-            load_model()
-            print("Model loaded")
+        # Ensure model is loaded - updated to use singleton
+        pipeline = PipelineSingleton.get_pipeline()
         
         # Run diarization
         print("\nStarting diarization...")
         start_time = time.time()
         
         print("Applying pipeline to audio...")
-        diarization = PIPELINE(
+        diarization = pipeline(
             audio_path,
             num_speakers=num_speakers,
             min_speakers=min_speakers,
@@ -386,12 +437,6 @@ def handler(job):
         
         duration = time.time() - start_time
         
-        # Clean up
-        try:
-            os.remove(audio_path)
-        except Exception as e:
-            print(f"Warning: Failed to clean up temporary file: {e}")
-        
         return {
             "segments": results,
             "metadata": {
@@ -409,10 +454,14 @@ def handler(job):
         error_msg = f"Processing error: {str(e)}\n{traceback.format_exc()}"
         print(error_msg)
         return {"error": error_msg}
+    finally:
+        # Clean up any temporary files
+        if audio_path:
+            cleanup_temp_file(audio_path)
 
 # Initialize the model when the worker starts
 try:
-    load_model()
+    PipelineSingleton.get_pipeline()
 except Exception as e:
     print(f"Failed to initialize model: {str(e)}")
     print(traceback.format_exc())
