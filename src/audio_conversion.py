@@ -47,8 +47,8 @@ def convert_to_wav(input_path):
                 loglevel='warning'   # Show warnings and errors
             )
             
-            # Run the conversion
-            out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)
+            # Run the conversion with overwrite flag
+            out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, overwrite_output=True)
             
             # Verify the output file exists and is not empty
             if not output_path.exists() or output_path.stat().st_size == 0:
