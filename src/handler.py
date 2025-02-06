@@ -5,7 +5,44 @@ import time
 import torch
 import ffmpeg
 import runpod
+import psutil
+import traceback
 from pyannote.audio import Pipeline
+import requests
+
+def get_memory_usage():
+    """Get current memory usage."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024  # in MB
+
+def get_container_memory_limit():
+    """Get the container's memory limit in GB."""
+    try:
+        with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
+            limit = int(f.read().strip()) / (1024**3)  # Convert bytes to GB
+            if limit > 1000000:  # If > 1000000GB, probably no limit
+                return None
+            return limit
+    except:
+        try:
+            # Try v2 cgroup path
+            with open('/sys/fs/cgroup/memory.max', 'r') as f:
+                content = f.read().strip()
+                if content == 'max':
+                    return None
+                return int(content) / (1024**3)  # Convert bytes to GB
+        except:
+            return None
+
+print("=== Starting worker initialization ===")
+print(f"Python version: {os.sys.version}")
+print(f"Current working directory: {os.getcwd()}")
+print(f"Directory contents: {os.listdir('.')}")
+print(f"Initial memory usage: {get_memory_usage():.1f} MB")
+memory_limit = get_container_memory_limit()
+print(f"Container memory limit: {'unlimited' if memory_limit is None else f'{memory_limit:.1f}GB'}")
+print("Environment variables:", {k: v for k, v in os.environ.items() if not k.startswith('AWS_')})
+print("=== Initialization logs end ===")
 
 # Load the pipeline globally for reuse across requests
 PIPELINE = None
@@ -23,7 +60,12 @@ def convert_to_wav(input_path):
         print(f"Audio conversion completed in {duration:.2f} seconds")
         return output_path
     except ffmpeg.Error as e:
-        raise RuntimeError(f"Failed to convert audio: {e.stderr.decode()}")
+        print(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+        raise RuntimeError(f"Failed to convert audio: {e.stderr.decode() if e.stderr else str(e)}")
+    except Exception as e:
+        print(f"Unexpected error in convert_to_wav: {str(e)}")
+        print(traceback.format_exc())
+        raise
 
 def get_optimal_batch_size():
     """Determine optimal batch size based on available hardware."""
@@ -39,80 +81,213 @@ def get_optimal_batch_size():
         # For CPU, use smaller batch size
         return 8
 
+def validate_input(job_input):
+    """Validate the input parameters."""
+    if not job_input.get('audio_url'):
+        raise ValueError("audio_url is required")
+    
+    options = job_input.get('options', {})
+    if not isinstance(options, dict):
+        raise ValueError("options must be a dictionary")
+    
+    # Validate speaker parameters
+    num_speakers = options.get('num_speakers')
+    if num_speakers is not None and not isinstance(num_speakers, int):
+        raise ValueError("num_speakers must be an integer")
+    
+    min_speakers = options.get('min_speakers')
+    if min_speakers is not None and not isinstance(min_speakers, int):
+        raise ValueError("min_speakers must be an integer")
+    
+    max_speakers = options.get('max_speakers')
+    if max_speakers is not None and not isinstance(max_speakers, int):
+        raise ValueError("max_speakers must be an integer")
+    
+    return True
+
+def download_audio(url):
+    """Download audio from pre-signed URL."""
+    try:
+        local_path = os.path.join('/tmp', 'input.wav')
+        print(f"Downloading audio from pre-signed URL")
+        
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        # Get file size if available
+        file_size = int(response.headers.get('content-length', 0))
+        
+        if file_size == 0:
+            print("Warning: Content-Length header not available, cannot track progress")
+        else:
+            print(f"File size: {file_size / 1024 / 1024:.1f}MB")
+        
+        start_time = time.time()
+        bytes_downloaded = 0
+        last_log_time = start_time
+        
+        with open(local_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    bytes_downloaded += len(chunk)
+                    f.write(chunk)
+                    
+                    # Log progress every second
+                    current_time = time.time()
+                    if current_time - last_log_time >= 1.0:
+                        if file_size:
+                            progress = (bytes_downloaded / file_size) * 100
+                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
+                            print(f"Download progress: {progress:.1f}% ({speed:.1f}MB/s)")
+                        else:
+                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
+                            print(f"Downloaded {bytes_downloaded / 1024 / 1024:.1f}MB ({speed:.1f}MB/s)")
+                        last_log_time = current_time
+        
+        total_time = time.time() - start_time
+        average_speed = bytes_downloaded / total_time / 1024 / 1024  # MB/s
+        print(f"Download completed: {bytes_downloaded / 1024 / 1024:.1f}MB in {total_time:.1f}s ({average_speed:.1f}MB/s)")
+        
+        return local_path
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Failed to download audio: {str(e)}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error during download: {str(e)}")
+
 def load_model():
     global PIPELINE
     if PIPELINE is None:
-        print("Loading pyannote.audio pipeline...")
-        start_time = time.time()
-        
-        auth_token = os.environ.get('HUGGINGFACE_TOKEN')
-        if not auth_token:
-            raise ValueError("HUGGINGFACE_TOKEN environment variable is required")
-        
-        # Get optimal parameters based on hardware
-        batch_size = get_optimal_batch_size()
-        num_workers = os.cpu_count() or 4  # CPU count or default to 4
-        if not torch.cuda.is_available():
-            # Reduce workers for CPU to avoid memory issues
-            num_workers = min(num_workers, 2)
-        
-        print(f"Using batch_size={batch_size}, num_workers={num_workers}")
-        
-        PIPELINE = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=auth_token
-        )
-        
-        # Configure based on available hardware
-        if torch.cuda.is_available():
-            print("CUDA is available, moving pipeline to GPU")
-            PIPELINE.to(torch.device("cuda"))
-            # GPU optimizations
-            PIPELINE = PIPELINE.half()  # FP16 for GPU
-            print(f"Using GPU: {torch.cuda.get_device_name()}")
-            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-        else:
-            print("CUDA is not available, optimizing for CPU")
+        try:
+            print("Loading pyannote.audio pipeline...")
+            start_time = time.time()
             
-        duration = time.time() - start_time
-        print(f"Pipeline loaded in {duration:.2f} seconds")
+            auth_token = os.environ.get('HUGGINGFACE_TOKEN')
+            if not auth_token:
+                raise ValueError("HUGGINGFACE_TOKEN environment variable is required")
+            
+            print("Environment check:")
+            print(f"CUDA available: {torch.cuda.is_available()}")
+            print(f"Python version: {os.sys.version}")
+            print(f"Torch version: {torch.__version__}")
+            print(f"Number of CPU cores: {os.cpu_count()}")
+            
+            # Load pipeline with default settings
+            PIPELINE = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=auth_token
+            )
+            
+            # Configure based on available hardware
+            if torch.cuda.is_available():
+                print("CUDA is available, optimizing for GPU")
+                PIPELINE.to(torch.device("cuda"))
+                # Enable cudnn benchmarking for better performance
+                torch.backends.cudnn.benchmark = True
+                print(f"Using GPU: {torch.cuda.get_device_name()}")
+                print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+            else:
+                print("CUDA is not available, running on CPU")
+                
+            duration = time.time() - start_time
+            print(f"Pipeline loaded in {duration:.2f} seconds")
+        except Exception as e:
+            print(f"Error in load_model: {str(e)}")
+            print(traceback.format_exc())
+            raise
+
+def debug_hook(step_name, step_artifact, file=None, **kwargs):
+    """Debug hook for pyannote pipeline progress."""
+    current_time = time.strftime('%H:%M:%S')
+    print(f"\nStep: {step_name} (Time: {current_time})")
+    
+    if step_name == "embeddings":
+        # Print detailed GPU info during embeddings step
+        if torch.cuda.is_available():
+            print(f"GPU Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.1f}MB")
+            print(f"GPU Memory reserved: {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
+            print(f"GPU Memory cached: {torch.cuda.memory_cached() / 1024**2:.1f}MB")
+            # Try to force garbage collection
+            torch.cuda.empty_cache()
+    
+    if 'completed' in kwargs and 'total' in kwargs:
+        completed = kwargs['completed']
+        total = kwargs['total']
+        percent = (completed / total) * 100 if total > 0 else 0
+        print(f"Progress: {completed}/{total} ({percent:.1f}%)")
+    
+    print(f"CPU Memory usage: {get_memory_usage():.1f} MB")
+    
+    # Print the type and shape of the artifact if available
+    if step_artifact is not None:
+        if isinstance(step_artifact, torch.Tensor):
+            print(f"Artifact shape: {step_artifact.shape}")
+            print(f"Artifact device: {step_artifact.device}")
+            print(f"Artifact dtype: {step_artifact.dtype}")
+        else:
+            print(f"Artifact type: {type(step_artifact)}")
 
 def handler(job):
-    """ Handler function for speaker diarization. """
+    """Handler for speaker diarization requests.
+    
+    Expected input format:
+    {
+        "input": {
+            "audio_url": "https://storage-service.com/audio/123.wav",  # Pre-signed URL
+            "options": {
+                "num_speakers": null,      # optional
+                "min_speakers": null,      # optional
+                "max_speakers": null,      # optional
+                "debug": false            # optional
+            }
+        }
+    }
+    """
     try:
+        print(f"\nReceived job input: {job}")
         job_input = job['input']
         
-        if 'audio_path' not in job_input:
-            return {"error": "audio_path is required in the input"}
+        # Validate input
+        validate_input(job_input)
         
-        audio_path = job_input['audio_path']
-        print(f"\nProcessing audio file: {audio_path}")
+        # Get options with defaults
+        options = job_input.get('options', {})
+        num_speakers = options.get('num_speakers')
+        min_speakers = options.get('min_speakers')
+        max_speakers = options.get('max_speakers')
+        debug_mode = options.get('debug', False)
         
-        # Convert audio to WAV format if needed
+        print(f"Processing with options: {options}")
+        
+        # Download audio from pre-signed URL
+        audio_path = download_audio(job_input['audio_url'])
+        
+        # Convert to WAV if needed (keeping this for flexibility)
         if not audio_path.lower().endswith('.wav'):
+            print("Converting to WAV format...")
             audio_path = convert_to_wav(audio_path)
-        
-        # Optional parameters
-        num_speakers = job_input.get('num_speakers', None)
-        min_speakers = job_input.get('min_speakers', None)
-        max_speakers = job_input.get('max_speakers', None)
+            print("Conversion complete")
         
         # Ensure model is loaded
         if PIPELINE is None:
+            print("Loading model...")
             load_model()
+            print("Model loaded")
         
         # Run diarization
         print("\nStarting diarization...")
         start_time = time.time()
         
+        print("Applying pipeline to audio...")
         diarization = PIPELINE(
             audio_path,
             num_speakers=num_speakers,
             min_speakers=min_speakers,
-            max_speakers=max_speakers
+            max_speakers=max_speakers,
+            hook=debug_hook if debug_mode else None
         )
         
         # Convert diarization results to a list of segments
+        print("Converting results to segments...")
         results = []
         for segment, track, speaker in diarization.itertracks(yield_label=True):
             results.append({
@@ -120,24 +295,41 @@ def handler(job):
                 "start": segment.start,
                 "end": segment.end
             })
+            if len(results) % 100 == 0:
+                print(f"Processed {len(results)} segments...")
         
         duration = time.time() - start_time
-        print(f"\nDiarization completed in {duration:.2f} seconds ({duration/60:.1f} minutes)")
-        print(f"Found {len(set(r['speaker'] for r in results))} speakers")
-        print(f"Generated {len(results)} segments")
+        
+        # Clean up
+        try:
+            os.remove(audio_path)
+        except Exception as e:
+            print(f"Warning: Failed to clean up temporary file: {e}")
         
         return {
             "segments": results,
-            "processing_time": duration,
-            "num_speakers": len(set(r['speaker'] for r in results)),
-            "num_segments": len(results)
+            "metadata": {
+                "processing_time_seconds": duration,
+                "num_speakers": len(set(r['speaker'] for r in results)),
+                "num_segments": len(results)
+            }
         }
         
+    except ValueError as e:
+        error_msg = f"Invalid input: {str(e)}"
+        print(error_msg)
+        return {"error": error_msg}
     except Exception as e:
-        print(f"Error during processing: {str(e)}")
-        return {"error": str(e)}
+        error_msg = f"Processing error: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
+        return {"error": error_msg}
 
 # Initialize the model when the worker starts
-load_model()
+try:
+    load_model()
+except Exception as e:
+    print(f"Failed to initialize model: {str(e)}")
+    print(traceback.format_exc())
+    raise
 
 runpod.serverless.start({"handler": handler})
