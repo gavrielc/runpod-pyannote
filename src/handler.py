@@ -9,6 +9,8 @@ import psutil
 import traceback
 from pyannote.audio import Pipeline
 import requests
+from urllib.parse import urlparse, unquote
+import uuid
 
 def get_memory_usage():
     """Get current memory usage."""
@@ -47,21 +49,159 @@ print("=== Initialization logs end ===")
 # Load the pipeline globally for reuse across requests
 PIPELINE = None
 
+def get_file_extension_from_url(url):
+    """Extract file extension from URL, defaulting to .wav if none found."""
+    path = unquote(urlparse(url).path)
+    ext = os.path.splitext(path)[1].lower()
+    return ext if ext else '.wav'
+
+def detect_audio_format(file_path):
+    """Detect audio format using ffprobe."""
+    try:
+        probe = ffmpeg.probe(file_path)
+        if 'streams' in probe and len(probe['streams']) > 0:
+            for stream in probe['streams']:
+                if stream['codec_type'] == 'audio':
+                    return stream['codec_name']
+        return None
+    except ffmpeg.Error:
+        return None
+
+def generate_unique_filename(prefix, extension):
+    """Generate a unique filename using timestamp and random string."""
+    timestamp = int(time.time() * 1000)
+    unique_id = str(uuid.uuid4())[:8]
+    return os.path.join('/tmp', f"{prefix}_{timestamp}_{unique_id}{extension}")
+
+def download_audio(url):
+    """Download audio from pre-signed URL with proper format handling."""
+    try:
+        # Get extension from URL
+        extension = get_file_extension_from_url(url)
+        temp_path = generate_unique_filename('input', extension)
+        print(f"Downloading audio from URL (detected format: {extension})")
+        
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        # Get file size if available
+        file_size = int(response.headers.get('content-length', 0))
+        
+        if file_size == 0:
+            print("Warning: Content-Length header not available, cannot track progress")
+        else:
+            print(f"File size: {file_size / 1024 / 1024:.1f}MB")
+        
+        start_time = time.time()
+        bytes_downloaded = 0
+        last_log_time = start_time
+        
+        with open(temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    bytes_downloaded += len(chunk)
+                    f.write(chunk)
+                    
+                    # Log progress every second
+                    current_time = time.time()
+                    if current_time - last_log_time >= 1.0:
+                        if file_size:
+                            progress = (bytes_downloaded / file_size) * 100
+                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
+                            print(f"Download progress: {progress:.1f}% ({speed:.1f}MB/s)")
+                        else:
+                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
+                            print(f"Downloaded {bytes_downloaded / 1024 / 1024:.1f}MB ({speed:.1f}MB/s)")
+                        last_log_time = current_time
+        
+        total_time = time.time() - start_time
+        average_speed = bytes_downloaded / total_time / 1024 / 1024  # MB/s
+        print(f"Download completed: {bytes_downloaded / 1024 / 1024:.1f}MB in {total_time:.1f}s ({average_speed:.1f}MB/s)")
+        
+        # Detect actual format
+        detected_format = detect_audio_format(temp_path)
+        print(f"Detected audio format: {detected_format}")
+        
+        # Convert to WAV if needed
+        if detected_format and detected_format != 'pcm_s16le':
+            print(f"Converting from {detected_format} to WAV format...")
+            wav_path = convert_to_wav(temp_path)
+            try:
+                os.remove(temp_path)  # Clean up original file
+            except Exception as e:
+                print(f"Warning: Failed to clean up temporary file: {e}")
+            return wav_path
+        elif detected_format == 'pcm_s16le':
+            print("File is already in WAV format, no conversion needed")
+            return temp_path
+        else:
+            print("Could not detect format, attempting conversion anyway...")
+            wav_path = convert_to_wav(temp_path)
+            try:
+                os.remove(temp_path)  # Clean up original file
+            except Exception as e:
+                print(f"Warning: Failed to clean up temporary file: {e}")
+            return wav_path
+            
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Failed to download audio: {str(e)}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error during download: {str(e)}")
+
 def convert_to_wav(input_path):
     """Convert audio file to WAV format."""
-    output_path = os.path.splitext(input_path)[0] + '.wav'
+    output_path = generate_unique_filename('converted', '.wav')
     try:
         print(f"Starting audio conversion of {input_path}")
         start_time = time.time()
+        
+        # Get input file information
+        probe = ffmpeg.probe(input_path)
+        input_sample_rate = next(
+            (stream['sample_rate'] for stream in probe['streams'] 
+             if stream['codec_type'] == 'audio'),
+            '16000'  # default to 16kHz if not found
+        )
+        
+        print(f"Input sample rate: {input_sample_rate}Hz")
+        
+        # Convert to WAV with specific parameters
         stream = ffmpeg.input(input_path)
-        stream = ffmpeg.output(stream, output_path, acodec='pcm_s16le', ac=1, ar='16k')
-        ffmpeg.run(stream, overwrite_output=True, capture_stdout=True, capture_stderr=True)
+        stream = ffmpeg.output(
+            stream, 
+            output_path,
+            acodec='pcm_s16le',  # 16-bit PCM
+            ac=1,                # mono
+            ar='16000',          # 16kHz
+            loglevel='warning'   # Show warnings and errors
+        )
+        
+        # Run the conversion
+        out, err = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)
+        
+        # Verify the output file exists and is not empty
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("Conversion failed: output file is missing or empty")
+            
         duration = time.time() - start_time
         print(f"Audio conversion completed in {duration:.2f} seconds")
+        
+        # Verify the converted file
+        output_probe = ffmpeg.probe(output_path)
+        output_stream = next((stream for stream in output_probe['streams'] 
+                            if stream['codec_type'] == 'audio'), None)
+        
+        if output_stream:
+            print(f"Converted audio: {output_stream['codec_name']}, "
+                  f"{output_stream['sample_rate']}Hz, "
+                  f"{output_stream['channels']} channel(s)")
+        
         return output_path
+        
     except ffmpeg.Error as e:
-        print(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
-        raise RuntimeError(f"Failed to convert audio: {e.stderr.decode() if e.stderr else str(e)}")
+        error_message = e.stderr.decode() if e.stderr else str(e)
+        print(f"FFmpeg error: {error_message}")
+        raise RuntimeError(f"Failed to convert audio: {error_message}")
     except Exception as e:
         print(f"Unexpected error in convert_to_wav: {str(e)}")
         print(traceback.format_exc())
@@ -104,55 +244,6 @@ def validate_input(job_input):
         raise ValueError("max_speakers must be an integer")
     
     return True
-
-def download_audio(url):
-    """Download audio from pre-signed URL."""
-    try:
-        local_path = os.path.join('/tmp', 'input.wav')
-        print(f"Downloading audio from pre-signed URL")
-        
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        # Get file size if available
-        file_size = int(response.headers.get('content-length', 0))
-        
-        if file_size == 0:
-            print("Warning: Content-Length header not available, cannot track progress")
-        else:
-            print(f"File size: {file_size / 1024 / 1024:.1f}MB")
-        
-        start_time = time.time()
-        bytes_downloaded = 0
-        last_log_time = start_time
-        
-        with open(local_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    bytes_downloaded += len(chunk)
-                    f.write(chunk)
-                    
-                    # Log progress every second
-                    current_time = time.time()
-                    if current_time - last_log_time >= 1.0:
-                        if file_size:
-                            progress = (bytes_downloaded / file_size) * 100
-                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
-                            print(f"Download progress: {progress:.1f}% ({speed:.1f}MB/s)")
-                        else:
-                            speed = bytes_downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
-                            print(f"Downloaded {bytes_downloaded / 1024 / 1024:.1f}MB ({speed:.1f}MB/s)")
-                        last_log_time = current_time
-        
-        total_time = time.time() - start_time
-        average_speed = bytes_downloaded / total_time / 1024 / 1024  # MB/s
-        print(f"Download completed: {bytes_downloaded / 1024 / 1024:.1f}MB in {total_time:.1f}s ({average_speed:.1f}MB/s)")
-        
-        return local_path
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to download audio: {str(e)}")
-    except Exception as e:
-        raise RuntimeError(f"Unexpected error during download: {str(e)}")
 
 def load_model():
     global PIPELINE
@@ -258,14 +349,9 @@ def handler(job):
         
         print(f"Processing with options: {options}")
         
-        # Download audio from pre-signed URL
+        # Download and convert audio if needed
         audio_path = download_audio(job_input['audio_url'])
-        
-        # Convert to WAV if needed (keeping this for flexibility)
-        if not audio_path.lower().endswith('.wav'):
-            print("Converting to WAV format...")
-            audio_path = convert_to_wav(audio_path)
-            print("Conversion complete")
+        print(f"Final audio path: {audio_path}")
         
         # Ensure model is loaded
         if PIPELINE is None:
