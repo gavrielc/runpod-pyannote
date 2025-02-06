@@ -14,8 +14,11 @@ RUN --mount=type=cache,target=/var/cache/apt \
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
     update-alternatives --set python3 /usr/bin/python3.11
 
+# Create and use app directory
+WORKDIR /app
+
 # Install pip dependencies in multiple steps for better caching
-COPY builder/requirements.txt /requirements.txt
+COPY builder/requirements.txt /app/requirements.txt
 
 # Install PyTorch first (biggest dependency)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -24,10 +27,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Install other dependencies
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -r /requirements.txt --no-cache-dir && \
-    rm /requirements.txt
+    python3 -m pip install -r /app/requirements.txt --no-cache-dir && \
+    rm /app/requirements.txt
 
-# Add src files (Worker Template)
-ADD src .
+# Copy the src directory
+COPY src /app/src
 
-CMD python3 -u /handler.py
+# Ensure src is a package
+RUN touch /app/src/__init__.py
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Run the handler from the src directory
+CMD python3 -u /app/src/handler.py
