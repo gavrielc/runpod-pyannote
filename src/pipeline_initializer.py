@@ -6,7 +6,7 @@ import torch
 import traceback
 from threading import Lock
 from pyannote.audio import Pipeline
-from .utils import get_memory_usage
+from src.utils import get_memory_usage
 
 class PipelineSingleton:
     _instance = None

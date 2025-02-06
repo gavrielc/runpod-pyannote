@@ -6,8 +6,8 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 from pathlib import Path
 
-from .file_utils import temporary_audio_file, get_file_extension_from_url
-from .audio_conversion import detect_audio_format, convert_to_wav
+from src.file_utils import temporary_audio_file, get_file_extension_from_url
+from src.audio_conversion import detect_audio_format, convert_to_wav
 
 def create_robust_session():
     """Create a requests session with retry logic and timeouts."""

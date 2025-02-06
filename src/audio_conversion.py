@@ -5,7 +5,7 @@ import ffmpeg
 import traceback
 from pathlib import Path
 
-from .file_utils import temporary_audio_file, cleanup_temp_file
+from src.file_utils import temporary_audio_file, cleanup_temp_file
 
 def detect_audio_format(file_path):
     """Detect audio format using ffprobe."""

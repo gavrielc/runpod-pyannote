@@ -5,10 +5,10 @@ import time
 import traceback
 import runpod
 
-from .utils import get_memory_usage, get_container_memory_limit, validate_input
-from .pipeline_initializer import PipelineSingleton, debug_hook
-from .network_utils import download_audio
-from .file_utils import cleanup_temp_file
+from src.utils import get_memory_usage, get_container_memory_limit, validate_input
+from src.pipeline_initializer import PipelineSingleton, debug_hook
+from src.network_utils import download_audio
+from src.file_utils import cleanup_temp_file
 
 print("=== Starting worker initialization ===")
 print(f"Python version: {os.sys.version}")
